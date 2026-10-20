@@ -1,0 +1,7 @@
+RDSPP-Tag fuer Behaelter -   =H01GDK01CM001-CM
+
+fuer Stutzen -               =H01GDK01CM001-CM-XL05
+
+Fuer Messstelle -         =H01GDK01BL002-BL01  
+
+Fuer Rohrleitung -         =H01GDK01WP011-WP

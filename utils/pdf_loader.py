@@ -1,0 +1,52 @@
+"""
+PDF to image conversion using PyMuPDF with Streamlit caching.
+"""
+
+import fitz  # PyMuPDF
+import io
+import streamlit as st
+from PIL import Image
+
+
+@st.cache_data(show_spinner=False)
+def pdf_page_count(pdf_bytes):
+    """Return number of pages in the PDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    count = len(doc)
+    doc.close()
+    return count
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def pdf_to_image(pdf_bytes, page_num=0, dpi=300, max_dimension=10000):
+    """Convert a single PDF page to a PIL Image."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    if page_num < 0 or page_num >= len(doc):
+        doc.close()
+        raise ValueError(f"Page {page_num} out of range (0-{len(doc)-1})")
+
+    page = doc[page_num]
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    doc.close()
+
+    w, h = img.size
+    longest = max(w, h)
+    if longest > max_dimension:
+        scale = max_dimension / longest
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    return img
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def pdf_has_text_layer(pdf_bytes, page_num=0):
+    """Check if the PDF page has a real text layer."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    text = page.get_text().strip()
+    doc.close()
+    return bool(text), text

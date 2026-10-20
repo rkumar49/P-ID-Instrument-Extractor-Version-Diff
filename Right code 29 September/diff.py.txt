@@ -1,0 +1,79 @@
+"""Compare two versions of instrument data."""
+
+import math
+import pandas as pd
+
+
+def _key(row):
+    cid = str(row.get("component_id") or "").strip()
+    if cid and cid.lower() != "nan":
+        return cid.upper()
+    fx = int(row.get("x", 0) or 0) // 100
+    fy = int(row.get("y", 0) or 0) // 100
+    return f"{row.get('func','')}@{fx},{fy}"
+
+
+def compare_versions(df_old, df_new, move_threshold_px=50):
+    """Return a DataFrame with one row per instrument + status."""
+    if df_old is None or df_old.empty:
+        df_old = pd.DataFrame(columns=["func", "system_code", "component_id", "pipe_sizes", "x", "y"])
+    if df_new is None or df_new.empty:
+        df_new = df_old.iloc[0:0].copy()
+
+    old_map = {_key(r): r for _, r in df_old.iterrows()}
+    new_map = {_key(r): r for _, r in df_new.iterrows()}
+
+    rows = []
+    for k in sorted(set(old_map) | set(new_map)):
+        old = old_map.get(k)
+        new = new_map.get(k)
+
+        row = {
+            "Key": k,
+            "Status": "",
+            "Func (old)": old.get("func", "") if old is not None else "",
+            "Func (new)": new.get("func", "") if new is not None else "",
+            "Sys (old)":  old.get("system_code", "") if old is not None else "",
+            "Sys (new)":  new.get("system_code", "") if new is not None else "",
+            "Pipe (old)": old.get("pipe_sizes", "") if old is not None else "",
+            "Pipe (new)": new.get("pipe_sizes", "") if new is not None else "",
+            "X (old)": int(old.get("x", 0) or 0) if old is not None else "",
+            "Y (old)": int(old.get("y", 0) or 0) if old is not None else "",
+            "X (new)": int(new.get("x", 0) or 0) if new is not None else "",
+            "Y (new)": int(new.get("y", 0) or 0) if new is not None else "",
+            "ΔX": "",
+            "ΔY": "",
+            "Δ Dist": "",
+        }
+
+        if old is None:
+            row["Status"] = "added"
+        elif new is None:
+            row["Status"] = "deleted"
+        else:
+            content_changed = (
+                (old.get("func") or "") != (new.get("func") or "")
+                or (old.get("system_code") or "") != (new.get("system_code") or "")
+                or (old.get("pipe_sizes") or "") != (new.get("pipe_sizes") or "")
+            )
+            dx = int(new.get("x", 0) or 0) - int(old.get("x", 0) or 0)
+            dy = int(new.get("y", 0) or 0) - int(old.get("y", 0) or 0)
+            dist = math.hypot(dx, dy)
+            row["ΔX"], row["ΔY"], row["Δ Dist"] = dx, dy, round(dist, 1)
+
+            moved = dist >= move_threshold_px
+            if content_changed and moved:
+                row["Status"] = "modified+moved"
+            elif content_changed:
+                row["Status"] = "modified"
+            elif moved:
+                row["Status"] = "moved"
+            else:
+                row["Status"] = "unchanged"
+
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+    order = {"added": 0, "deleted": 1, "modified+moved": 2, "modified": 3, "moved": 4, "unchanged": 5}
+    result["_ord"] = result["Status"].map(order).fillna(99)
+    return result.sort_values(["_ord", "Key"]).drop(columns=["_ord"]).reset_index(drop=True)

@@ -1,0 +1,3 @@
+ORACLE_USER = "Kumar"
+ORACLE_PASS = "TestQ123"
+ORACLE_DSN  = "pdvOraev:1521/SKL"

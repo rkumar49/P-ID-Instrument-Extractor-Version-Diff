@@ -1,0 +1,9 @@
+streamlit
+opencv-python
+pillow
+numpy
+pandas
+easyocr
+openpyxl
+pymupdf
+streamlit-image-coordinates

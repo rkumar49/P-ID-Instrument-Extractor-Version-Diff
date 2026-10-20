@@ -1,0 +1,600 @@
+﻿"""
+CAD Dimension Detector - Main Streamlit App
+
+Pipeline:
+    1. Upload a CAD drawing (PDF or image)
+    2. Preprocess (grayscale → threshold → clean)
+    3. Compare original vs. preprocessed side by side
+    4. Zoom Inspector with real scrollbars (0.1× to 10×)
+    5. Extract text — PDF text layer (best) OR OCR fallback
+    6. Classify into categories
+    7. Group into instrument records (+ unassigned codes)
+    8. Human verification (checkbox per row)
+    9. Save to Oracle (new)
+   10. Export to CSV / Excel (formula-safe)
+"""
+
+import io as _io
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
+# ------------------------------------------------------------------
+# Make project root importable
+# ------------------------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.preprocess import preprocess_pipeline
+from utils.pdf_loader import pdf_to_image, pdf_page_count, pdf_has_text_layer
+from utils.ui import side_by_side_comparison, zoom_inspector
+from utils.ocr import run_ocr, draw_overlay, draw_categorized_overlay
+from utils.classify import classify_text, group_instruments
+from utils.pdf_text import extract_text_from_pdf, count_pdf_text_items
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prefix '=' with apostrophe so Excel treats strings as text, not formulas.
+    Prevents #NAME? errors in exported workbooks.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].apply(
+                lambda v: "'" + v if isinstance(v, str) and v.startswith("=") else v
+            )
+    return df
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="CAD Dimension Detector",
+    page_icon="📐",
+    layout="wide",
+)
+
+st.title("📐 CAD Dimension Detector")
+st.caption(
+    "Upload a CAD drawing → preprocess → inspect → extract text → classify → verify → save → export."
+)
+
+
+# ============================================================
+# SIDEBAR — PREPROCESSING
+# ============================================================
+st.sidebar.header("⚙️ Preprocessing")
+
+do_denoise = st.sidebar.checkbox("Denoise", value=False)
+denoise_strength = st.sidebar.slider(
+    "Denoise strength", 0, 10, 3, disabled=not do_denoise,
+)
+
+do_threshold = st.sidebar.checkbox("Adaptive Threshold", value=True)
+block_size = st.sidebar.slider(
+    "Block size", 3, 71, 31, step=2, disabled=not do_threshold,
+)
+c_value = st.sidebar.slider(
+    "C (constant subtracted)", -10, 30, 15, disabled=not do_threshold,
+)
+
+do_invert = st.sidebar.checkbox("Auto-invert if white-on-black", value=True)
+do_upscale = st.sidebar.checkbox("Upscale small images", value=True)
+
+
+# ============================================================
+# SIDEBAR — EXTRACTION CONTROLS
+# ============================================================
+st.sidebar.header("🔎 Text Extraction")
+
+min_conf = st.sidebar.slider(
+    "Minimum confidence",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.15,
+    step=0.05,
+    help="Lower to catch faint text. PDF text layer always scores 1.0.",
+)
+
+use_gpu = st.sidebar.checkbox(
+    "Use GPU for OCR (if available)",
+    value=False,
+    help="Leave off unless you have a CUDA-capable GPU.",
+)
+
+
+# ============================================================
+# FILE UPLOADER
+# ============================================================
+uploaded_file = st.file_uploader(
+    "Upload a CAD drawing",
+    type=["pdf", "png", "jpg", "jpeg", "bmp", "tiff"],
+)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if uploaded_file is None:
+    st.info("👆 Please upload a CAD drawing to get started.")
+    st.stop()
+
+file_bytes = uploaded_file.read()
+file_ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
+
+# ---------- Load image ----------
+image = None
+page_num = 0
+dpi = 300
+
+if file_ext == "pdf":
+    n_pages = pdf_page_count(file_bytes)
+
+    st.sidebar.header("📄 PDF Options")
+    st.sidebar.write(f"**Pages detected:** {n_pages}")
+
+    page_num = st.sidebar.number_input(
+        "Page to process (1-indexed)", 1, n_pages, 1, step=1,
+    ) - 1
+
+    dpi = st.sidebar.select_slider(
+        "Render DPI", [100, 150, 200, 300, 400, 600], value=300,
+    )
+
+    with st.spinner(f"Rendering PDF page {page_num + 1} at {dpi} DPI..."):
+        image = pdf_to_image(file_bytes, page_num=page_num, dpi=dpi)
+
+    has_text, sample = pdf_has_text_layer(file_bytes, page_num)
+    if has_text:
+        st.success(f"✅ PDF has a text layer (sample: `{sample[:80]}...`)")
+    else:
+        st.info("ℹ️ No text layer — OCR is required.")
+
+else:
+    image = Image.open(uploaded_file).convert("RGB")
+
+image_np = np.array(image)
+
+# ---------- Preprocess ----------
+with st.spinner("Preprocessing..."):
+    processed, steps = preprocess_pipeline(
+        image_np,
+        do_denoise=do_denoise,
+        denoise_strength=denoise_strength,
+        do_threshold=do_threshold,
+        block_size=block_size,
+        c=c_value,
+        do_invert=do_invert,
+        do_upscale=do_upscale,
+    )
+
+st.session_state["original_image"] = image_np
+st.session_state["processed_image"] = processed
+st.session_state["preprocess_steps"] = steps
+st.session_state["filename"] = uploaded_file.name
+
+
+# ============================================================
+# SECTION 1 — SIDE-BY-SIDE COMPARISON
+# ============================================================
+st.subheader("1️⃣ Side-by-Side Comparison")
+side_by_side_comparison(
+    image_np, processed,
+    label_left="Original",
+    label_right="Preprocessed",
+)
+st.divider()
+
+
+# ============================================================
+# SECTION 2 — ZOOM INSPECTOR
+# ============================================================
+st.subheader("2️⃣ Zoom Inspector")
+images_dict = {
+    "Original (raw)": image_np,
+    "Preprocessed (final)": processed,
+    "1. Grayscale": steps.get("grayscale"),
+    "2. Denoised": steps.get("denoised"),
+    "3. Binary (thresholded)": steps.get("binary"),
+    "4. Final binary": steps.get("final_binary"),
+}
+images_dict = {k: v for k, v in images_dict.items() if v is not None}
+zoom_inspector(images_dict, key="main_inspector")
+st.divider()
+
+
+# ============================================================
+# SECTION 3 — TEXT EXTRACTION (PDF text layer OR OCR)
+# ============================================================
+st.subheader("3️⃣ Text Extraction & Instrument Schedule")
+
+# ---- Decide extraction method ----
+pdf_text_count = 0
+if file_ext == "pdf":
+    pdf_text_count = count_pdf_text_items(file_bytes, page_num)
+
+extraction_mode = "ocr"  # default
+
+if pdf_text_count >= 20:
+    st.success(
+        f"✅ **PDF has {pdf_text_count} text items.** "
+        f"Using **direct PDF text extraction** — 100% accurate, no OCR needed."
+    )
+    extraction_mode = "pdf_text"
+elif pdf_text_count > 0:
+    st.warning(
+        f"⚠️ PDF has only {pdf_text_count} text items. "
+        f"OCR is recommended for best results."
+    )
+    extraction_mode = st.radio(
+        "Extraction method:",
+        ["OCR (recommended)", "PDF text layer"],
+        horizontal=True,
+        key="extraction_mode",
+    )
+    extraction_mode = "pdf_text" if extraction_mode == "PDF text layer" else "ocr"
+else:
+    if file_ext == "pdf":
+        st.info("ℹ️ No PDF text layer found — will use **OCR** on the preprocessed image.")
+    else:
+        st.info("ℹ️ Image upload — will use **OCR** on the preprocessed image.")
+    extraction_mode = "ocr"
+
+# ---- Run extraction button ----
+run_btn = st.button("🚀 Extract & Classify", type="primary")
+
+if run_btn:
+    with st.spinner("Extracting text..."):
+        if extraction_mode == "pdf_text":
+            detections = extract_text_from_pdf(file_bytes, page_num=page_num, dpi=dpi)
+            st.info(f"Extracted **{len(detections)}** text items from PDF layer.")
+        else:
+            with st.spinner("Running OCR... (first run downloads the model, 1–2 min)"):
+                detections = run_ocr(processed, langs=("en", "de"), gpu=use_gpu)
+            st.info(f"OCR detected **{len(detections)}** text regions.")
+
+        # Classify every detection
+        for d in detections:
+            d["category"] = classify_text(d["text"])
+
+        # Group into instrument records + unassigned codes
+        instruments, unassigned = group_instruments(detections)
+
+    st.session_state["detections"] = detections
+    st.session_state["instruments"] = instruments
+    st.session_state["unassigned"] = unassigned
+
+    st.success(
+        f"✅ **{len(detections)}** text items · "
+        f"**{len(instruments)}** instrument records · "
+        f"**{len(unassigned)}** unassigned codes"
+    )
+
+# Retrieve from session
+detections = st.session_state.get("detections", None)
+instruments = st.session_state.get("instruments", None)
+unassigned = st.session_state.get("unassigned", None)
+
+if detections is not None:
+    filtered = [d for d in detections if d["confidence"] >= min_conf]
+    st.write(f"**After confidence ≥ {min_conf:.2f}:** {len(filtered)} detections")
+
+    # ---------------- Diagnostics ----------------
+    with st.expander("🔬 Diagnostics — detection counts by category"):
+        comp_dets = [d for d in detections if d.get("category") == "component_id"]
+        pipe_dets = [d for d in detections if d.get("category") == "pipe_size"]
+        sys_dets = [d for d in detections if d.get("category") == "system_code"]
+        func_dets = [d for d in detections if d.get("category") == "instrument_func"]
+        note_dets = [d for d in detections if d.get("category") == "note"]
+        noise_dets = [d for d in detections if d.get("category") == "noise"]
+
+        st.write(f"- Instrument functions: **{len(func_dets)}**")
+        st.write(f"- System codes: **{len(sys_dets)}**")
+        st.write(f"- Component IDs: **{len(comp_dets)}**")
+        st.write(f"- Pipe sizes: **{len(pipe_dets)}**")
+        st.write(f"- Notes: **{len(note_dets)}**")
+        st.write(f"- Noise: **{len(noise_dets)}**")
+
+        if comp_dets:
+            st.write("**Sample component IDs:**")
+            st.code(", ".join(d["text"] for d in comp_dets[:20]))
+
+    # ---------------- Categorized overlay ----------------
+    overlay_img = draw_categorized_overlay(processed, detections, min_conf=min_conf)
+
+    st.markdown("##### 🎨 Categorized overlay (zoomable)")
+    st.caption(
+        "🟠 Instrument function · 🟣 System code · 🔵 Component ID · "
+        "🟢 Pipe size · ⚪ Note/Noise"
+    )
+
+    zoom_inspector(
+        {
+            "Categorized overlay": overlay_img,
+            "Preprocessed (no boxes)": processed,
+            "Original (raw)": image_np,
+        },
+        key="overlay_inspector",
+    )
+
+    # ---------------- Category filter ----------------
+    st.markdown("##### 🗂️ Filter by category")
+    all_cats = sorted(set(d["category"] for d in filtered))
+    selected_cats = st.multiselect(
+        "Show only these categories:",
+        options=all_cats,
+        default=all_cats,
+        key="cat_filter",
+    )
+    filtered_cat = [d for d in filtered if d["category"] in selected_cats]
+
+    # ---------------- Detections table ----------------
+    st.markdown("##### 📋 All detections")
+    df_det = pd.DataFrame()
+    if filtered_cat:
+        df_det = pd.DataFrame([
+            {
+                "#": i + 1,
+                "Text": d["text"],
+                "Category": d["category"],
+                "Confidence": round(d["confidence"], 3),
+                "Source": d.get("source", "ocr"),
+                "X": d["x"], "Y": d["y"], "W": d["w"], "H": d["h"],
+            }
+            for i, d in enumerate(filtered_cat)
+        ])
+        st.dataframe(df_det, use_container_width=True, height=300)
+    else:
+        st.info("No detections match the current filters.")
+
+    # ---------------- Instrument schedule ----------------
+    st.markdown("##### 🧾 Instrument schedule (grouped)")
+    st.caption("Each row is one instrument. Uncheck **✓** to exclude from export.")
+
+    verified = pd.DataFrame()  # will be filled below if instruments exist
+
+    if instruments:
+        df_inst = pd.DataFrame([
+            {
+                "Verify": True,
+                "Function": r["func"],
+                "System Code": r["system_code"] or "",
+                "Component ID": r["component_id"] or "",
+                "Pipe Sizes": ", ".join(r["pipe_sizes"]),
+                "Confidence": round(r["confidence"], 3),
+                "X": r["x"],
+                "Y": r["y"],
+            }
+            for r in instruments
+            if r["confidence"] >= min_conf
+        ])
+
+        if not df_inst.empty:
+            edited = st.data_editor(
+                df_inst,
+                use_container_width=True,
+                height=400,
+                column_config={
+                    "Verify": st.column_config.CheckboxColumn(
+                        "✓",
+                        help="Uncheck to exclude from export",
+                        default=True,
+                    ),
+                },
+                key="instrument_editor",
+            )
+
+            verified = edited[edited["Verify"] == True].drop(columns=["Verify"])
+            st.caption(
+                f"**{len(verified)} / {len(edited)}** rows verified — "
+                f"only verified rows are exported."
+            )
+
+            # ---------------- Downloads ----------------
+            col_dl1, col_dl2 = st.columns(2)
+
+            with col_dl1:
+                csv_bytes = verified.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download verified instruments (CSV)",
+                    data=csv_bytes,
+                    file_name=f"instruments_{uploaded_file.name.rsplit('.', 1)[0]}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            with col_dl2:
+                excel_buf = _io.BytesIO()
+                verified_safe = excel_safe(verified)
+                df_det_safe = excel_safe(df_det) if not df_det.empty else df_det
+                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                    verified_safe.to_excel(writer, sheet_name="Instruments", index=False)
+                    if not df_det_safe.empty:
+                        df_det_safe.to_excel(writer, sheet_name="All Detections", index=False)
+                st.download_button(
+                    "⬇️ Download Excel (2 sheets)",
+                    data=excel_buf.getvalue(),
+                    file_name=f"report_{uploaded_file.name.rsplit('.', 1)[0]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+        else:
+            st.info("No instruments above the confidence threshold.")
+    else:
+        st.info("No instruments detected above the confidence threshold.")
+
+    # ---------------- Unassigned codes ----------------
+    if unassigned:
+        st.markdown("##### 📌 Unassigned codes")
+        st.caption(
+            "Codes detected but not grouped with any instrument. "
+            "May belong to off-screen or irregularly-formatted instruments."
+        )
+        df_un = pd.DataFrame([
+            {
+                "Type": u["type"],
+                "Text": u["text"],
+                "Confidence": round(u["confidence"], 3),
+                "X": u["x"],
+                "Y": u["y"],
+            }
+            for u in unassigned
+        ]).sort_values(["Type", "Text"]).reset_index(drop=True)
+        st.dataframe(df_un, use_container_width=True, height=250)
+
+        st.download_button(
+            "⬇️ Download unassigned codes (CSV)",
+            data=df_un.to_csv(index=False).encode("utf-8"),
+            file_name=f"unassigned_{uploaded_file.name.rsplit('.', 1)[0]}.csv",
+            mime="text/csv",
+        )
+
+    # ============================================================
+    # SAVE TO ORACLE
+    # ============================================================
+    st.divider()
+    st.subheader("💾 Save to Oracle")
+
+    col_v1, col_v2 = st.columns([3, 2])
+    with col_v1:
+        version_label = st.text_input(
+            "Version label",
+            value=uploaded_file.name.rsplit(".", 1)[0][-20:],
+            help="Short name (e.g., 'Rev13', 'v13', 'Baseline')",
+            key="version_label_input",
+        )
+    with col_v2:
+        st.write("")  # spacing
+        save_btn = st.button("💾 Save to Oracle", type="primary", use_container_width=True)
+
+    if save_btn:
+        # Determine what to save — verified rows if any, else all instruments
+        rows_to_save = []
+        if not verified.empty:
+            rows_to_save = verified.to_dict("records")
+        elif instruments:
+            rows_to_save = [
+                {
+                    "Function": r["func"],
+                    "System Code": r["system_code"] or "",
+                    "Component ID": r["component_id"] or "",
+                    "Pipe Sizes": ", ".join(r["pipe_sizes"]),
+                    "Confidence": r["confidence"],
+                    "X": r["x"],
+                    "Y": r["y"],
+                    "W": 0,
+                    "H": 0,
+                }
+                for r in instruments
+            ]
+
+        if not rows_to_save:
+            st.error("❌ Nothing to save — run extraction and verify at least one row.")
+        else:
+            # Normalize to the schema utils/oracle.save() expects
+            clean = []
+            for r in rows_to_save:
+                ps = r.get("Pipe Sizes") or r.get("pipe_sizes") or ""
+                clean.append({
+                    "func":         (r.get("Function") or r.get("func") or ""),
+                    "system_code":  (r.get("System Code") or r.get("system_code") or ""),
+                    "component_id": (r.get("Component ID") or r.get("component_id") or ""),
+                    "pipe_sizes":   [s.strip() for s in str(ps).split(",") if s.strip()],
+                    "confidence":   float(r.get("Confidence") or r.get("confidence") or 0),
+                    "x": int(r.get("X", 0) or r.get("x", 0) or 0),
+                    "y": int(r.get("Y", 0) or r.get("y", 0) or 0),
+                    "w": int(r.get("W", 0) or r.get("w", 0) or 0),
+                    "h": int(r.get("H", 0) or r.get("h", 0) or 0),
+                })
+
+            img_h, img_w = image_np.shape[:2]
+
+            try:
+                from utils.oracle import save as oracle_save
+                with st.spinner("Saving to Oracle..."):
+                    doc_id = oracle_save(
+                        filename=uploaded_file.name,
+                        version_label=version_label or "unlabeled",
+                        instruments=clean,
+                        page_width=img_w,
+                        page_height=img_h,
+                        detections=detections,
+                    )
+                st.success(
+                    f"✅ Saved **{len(clean)}** instruments to Oracle "
+                    f"(DOC_ID = **{doc_id}**)."
+                )
+                st.info("👉 Open **Versions & Diff** in the sidebar to browse or compare.")
+
+                # ---------- NEW: Save rendered PNG for visual diff ----------
+                try:
+                    from utils.oracle import save_render
+                    save_render(doc_id, image_np)
+                    st.caption(
+                        f"📁 Render saved for visual diff: "
+                        f"`output/renders/doc_{doc_id}.png`"
+                    )
+                except Exception as e_render:
+                    st.warning(f"⚠️ Could not save render for visual diff: {e_render}")
+
+            except Exception as e:
+                st.error(f"❌ Oracle save failed: {type(e).__name__}: {e}")
+                st.exception(e)
+
+else:
+    st.info("Click **🚀 Extract & Classify** to analyze the drawing.")
+
+st.divider()
+
+
+# ============================================================
+# SECTION 4 — EXPORT IMAGES
+# ============================================================
+st.subheader("4️⃣ Export Images")
+
+col_img1, col_img2 = st.columns(2)
+
+with col_img1:
+    st.download_button(
+        "⬇️ Download preprocessed image",
+        data=Image.fromarray(processed).tobytes(),
+        file_name=f"preprocessed_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+        mime="image/png",
+        use_container_width=True,
+    )
+
+with col_img2:
+    if detections is not None:
+        st.download_button(
+            "⬇️ Download categorized overlay",
+            data=overlay_img.tobytes(),
+            file_name=f"overlay_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# SIDEBAR — INFO
+# ============================================================
+st.sidebar.header("📊 Info")
+st.sidebar.write(f"**File:** {uploaded_file.name}")
+st.sidebar.write(f"**Original size:** {image.size}")
+st.sidebar.write(f"**Processed shape:** {processed.shape}")
+if detections is not None:
+    st.sidebar.write(f"**Detections:** {len(detections)}")
+if instruments is not None:
+    st.sidebar.write(f"**Instruments:** {len(instruments)}")
+if unassigned is not None:
+    st.sidebar.write(f"**Unassigned:** {len(unassigned)}")
